@@ -198,7 +198,32 @@ async function loadRosterFromPrincipal(force=false){
   }
 }
 
-function findPerson(code){let c=norm(code);if(!c)return null;return ROSTER.find(p=>[p.id,p.grootId,p.matricula,p.ext].some(v=>norm(v)===c))||null}
+// IDENTIFICAÇÃO PELO GROOT ID (corrigido 22/10/2026).
+// Antes procurava o código em id/Groot ID/matrícula/EXT ao mesmo tempo e
+// pegava o PRIMEIRO da lista em ordem alfabética: se a matrícula ou o ID
+// interno de uma pessoa fosse igual ao Groot ID de outra, a presença ia pra
+// pessoa errada. Agora a ordem é estrita: Groot ID → ID interno (só se a
+// pessoa não tiver outro Groot ID) → matrícula → EXT, e cada etapa só aceita
+// se achar UMA pessoa. Ambíguo = não marca ninguém.
+function normCode(v){let s=String(v??'').replace(/[\u0000-\u001F\s]+/g,'').trim();if(/^\d+\.0+$/.test(s))s=s.replace(/\.0+$/,'');return s.toLowerCase()}
+let lastFindIssue=null;
+function findPerson(code){
+  lastFindIssue=null;
+  let c=normCode(code);if(!c)return null;
+  const step=(fn)=>ROSTER.filter(p=>normCode(fn(p))===c);
+  let m=step(p=>p.grootId);
+  if(m.length===1)return m[0];
+  if(m.length>1){lastFindIssue={tipo:'duplicado',nomes:m.map(p=>p.nome)};return null}
+  m=step(p=>p.id).filter(p=>!normCode(p.grootId)||normCode(p.grootId)===c);
+  if(m.length===1)return m[0];
+  m=step(p=>p.matricula);
+  if(m.length===1)return m[0];
+  if(m.length>1){lastFindIssue={tipo:'duplicado',nomes:m.map(p=>p.nome)};return null}
+  m=step(p=>p.ext);
+  if(m.length===1)return m[0];
+  if(m.length>1){lastFindIssue={tipo:'duplicado',nomes:m.map(p=>p.nome)};return null}
+  return null;
+}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
 function beep(){try{let a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.frequency.value=880;o.connect(g);g.connect(a.destination);g.gain.setValueAtTime(.08,a.currentTime);g.gain.exponentialRampToValueAtTime(.001,a.currentTime+.12);o.start();o.stop(a.currentTime+.12)}catch(e){}}
 function alertBeep(){try{let a=new (window.AudioContext||window.webkitAudioContext)();[0,260,520].forEach(ms=>{let o=a.createOscillator(),g=a.createGain();o.type='square';o.frequency.value=220;o.connect(g);g.connect(a.destination);let t=a.currentTime+ms/1000;g.gain.setValueAtTime(.12,t);g.gain.exponentialRampToValueAtTime(.001,t+.18);o.start(t);o.stop(t+.18)})}catch(e){}}
@@ -362,7 +387,7 @@ async function registerPerson(p,source='manual',trocaFolga=false){
 
   return true;
 }
-async function markByCode(code,source='manual'){if(markBusy)return;markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);if(fs.known&&fs.isFolga){openFolgaConfirm(p,raw,source,'folga');return}if(!fs.known){openFolgaConfirm(p,raw,source,'unknown');return}await registerPerson(p,source,false)}finally{markBusy=false}}
+async function markByCode(code,source='manual'){if(markBusy)return;markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p&&lastFindIssue&&lastFindIssue.tipo==='duplicado'){showResult(null,'Código em mais de um cadastro: '+lastFindIssue.nomes.join(' / '),false);showPointAlert('Código repetido no cadastro.','Este código pertence a mais de um colaborador ('+lastFindIssue.nomes.join(' / ')+'). Nenhum ponto foi registrado — corrija o cadastro.');return}if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);if(fs.known&&fs.isFolga){openFolgaConfirm(p,raw,source,'folga');return}if(!fs.known){openFolgaConfirm(p,raw,source,'unknown');return}await registerPerson(p,source,false)}finally{markBusy=false}}
 async function principalGetExisting(r){
   const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
     '?colaborador_id=eq.'+encodeURIComponent(String(r.personId))+
