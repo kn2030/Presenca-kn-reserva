@@ -390,7 +390,7 @@ async function registerPerson(p,source='manual',trocaFolga=false,fs=null){
   showResult(p,msg,true);
   render();
   beep();
-  syncPending();
+  sendNow(r).then(()=>syncPending());
 
   // Divergência de horário (atraso, entrada antecipada, ou horário/escala
   // não identificado no cadastro) NUNCA impede a presença e NÃO dispara
@@ -484,48 +484,46 @@ async function checkSheetSynced(r){
   }
 }
 
+// Atualiza UMA batida no armazenamento local sem sobrescrever batidas novas
+// que entraram enquanto a sincronização rodava (antes o loop gravava a lista
+// inteira antiga por cima e uma batida feita no meio podia sumir).
+function patchReg(eventId,patch){
+  const regs=loadRegs().map(normalizeOld);
+  const r=regs.find(x=>x.eventId===eventId);
+  if(!r) return;
+  Object.assign(r,patch);
+  saveRegs(regs);
+}
+// Envia a batida pro banco NA HORA do bipe, sem esperar a fila.
+async function sendNow(r){
+  if(!navigator.onLine) return;
+  const p=await syncPrincipal(r);
+  patchReg(r.eventId,{principalSync:p.ok?'synced':'pending',principalError:p.ok?'':(p.error||'erro no Principal'),lastTryAt:new Date().toISOString()});
+  render();
+}
 async function syncPending(){
   if(syncing || !navigator.onLine){ render(); return; }
   syncing=true;
-  let regs=loadRegs().map(normalizeOld), changed=false;
   try{
-    for(const r of regs.filter(x=>x.principalSync!=='synced' || x.sheetSync!=='synced')){
-      if(r.principalSync!=='synced'){
-        const p=await syncPrincipal(r);
-        r.principalSync=p.ok?'synced':'pending';
-        r.principalError=p.ok?'':(p.error||'erro no Principal');
-        changed=true;
-      }
-
-      if(r.sheetSync!=='synced'){
-        // O envio pro Sheets agora é responsabilidade do Supabase (Database
-        // Webhook -> Apps Script), não mais do aparelho. Aqui só conferimos
-        // se já foi confirmado — e só depois que o Principal confirmar,
-        // porque sem a linha no Supabase o webhook nem chega a disparar.
-        if(r.principalSync==='synced'){
-          const c=await checkSheetSynced(r);
-          if(c.confirmed){
-            r.sheetSync='synced';
-            r.sheetUnconfirmed=false;
-            r.sheetError='';
-          }else{
-            r.sheetSync='pending';
-            r.sheetUnconfirmed=false;
-            r.sheetError=c.error||'Aguardando a planilha confirmar';
-          }
-        }else{
-          r.sheetSync='pending';
-          r.sheetError='Aguardando confirmar no Principal antes de checar a planilha';
-        }
-        changed=true;
-      }
-
-      r.lastTryAt=new Date().toISOString();
-      saveRegs(regs);
-      render();
+    // 1º: tudo que ainda não chegou no banco (rápido, é o que importa).
+    const semBanco=loadRegs().map(normalizeOld).filter(x=>x.principalSync!=='synced');
+    for(const r of semBanco){
+      const p=await syncPrincipal(r);
+      patchReg(r.eventId,{principalSync:p.ok?'synced':'pending',principalError:p.ok?'':(p.error||'erro no Principal'),lastTryAt:new Date().toISOString()});
+    }
+    render();
+    // 2º: conferência da planilha "Presença KN - Reserva" — só batidas dos
+    // últimos 2 dias, no máximo 15 por rodada (não trava mais a fila).
+    const desde=addDaysIso(nowParts().date,-1);
+    const conferir=loadRegs().map(normalizeOld)
+      .filter(x=>x.principalSync==='synced'&&x.sheetSync!=='synced'&&String(x.date||'')>=desde).slice(0,15);
+    for(const r of conferir){
+      const c=await checkSheetSynced(r);
+      patchReg(r.eventId,c.confirmed
+        ?{sheetSync:'synced',sheetUnconfirmed:false,sheetError:''}
+        :{sheetSync:'pending',sheetUnconfirmed:false,sheetError:c.error||'Aguardando a planilha confirmar'});
     }
   }finally{
-    if(changed) saveRegs(regs);
     syncing=false;
     render();
   }
