@@ -254,7 +254,7 @@ function normalizeOld(r){
 }
 function scaleKey(v){let x=String(v||'').toUpperCase().replace(/\s+/g,' ').replace(/\s*-\s*/g,' - ').trim();let m=x.match(/^(SVC\s*-\s*[A-Z]\d?\s*-\s*\d{2}H)/);return m?m[1].replace(/\s+/g,' '):x}
 // ===== Calendário de folgas da Headcount =====
-const FOLGAS_LS_KEY='kn_reserva_folgas_hc_v1';
+const FOLGAS_LS_KEY='kn_reserva_folgas_hc_v2';
 let folgasLive=new Map(), folgasLiveAt=0, folgasLoading=false;
 try{
   const c=JSON.parse(localStorage.getItem(FOLGAS_LS_KEY)||'null');
@@ -267,11 +267,22 @@ async function loadFolgasLive(force=false){
   folgasLoading=true;
   try{
     const today=nowParts().date;
-    const url=SUPABASE_URL+'/rest/v1/kn_escala_folgas?select=escala_key,data,status'+
-      '&data=gte.'+addDaysIso(today,-3)+'&data=lte.'+addDaysIso(today,45)+'&limit=10000';
-    const res=await fetch(url,{headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY}});
-    if(!res.ok) throw new Error('Folgas HTTP '+res.status);
-    const rows=await res.json();
+    // O Supabase devolve no máximo 1000 linhas por consulta. A janela antiga
+    // (-3 a +45 dias) passava disso e, como vinha sem ordem, o dia de HOJE às
+    // vezes ficava de fora → "Calendário de folga não configurado" pra todo mundo.
+    // Agora: janela menor, ordenada por data (hoje vem primeiro) e paginada.
+    const base=SUPABASE_URL+'/rest/v1/kn_escala_folgas?select=escala_key,data,status'+
+      '&data=gte.'+addDaysIso(today,-1)+'&data=lte.'+addDaysIso(today,14)+
+      '&order=data.asc,escala_key.asc';
+    const rows=[];
+    for(let off=0;off<20000;off+=1000){
+      const res=await fetch(base+'&limit=1000&offset='+off,{headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY}});
+      if(!res.ok) throw new Error('Folgas HTTP '+res.status);
+      const part=await res.json();
+      if(!Array.isArray(part)) break;
+      rows.push(...part);
+      if(part.length<1000) break;
+    }
     if(Array.isArray(rows)&&rows.length){
       folgasLive=new Map(rows.map(r=>[scaleKey(r.escala_key)+'|'+r.data,String(r.status||'').toUpperCase()]));
       try{localStorage.setItem(FOLGAS_LS_KEY,JSON.stringify({at:Date.now(),rows:rows.map(r=>[scaleKey(r.escala_key),r.data,String(r.status||'').toUpperCase()])}))}catch(e){}
@@ -312,7 +323,7 @@ function openFolgaConfirm(p,raw,source,mode='folga'){
   setTimeout(()=>$('folgaYesBtn').focus(),30);
 }
 function closeFolgaConfirm(){pendingFolgaMark=null;$('folgaOverlay').classList.remove('show');$('codeInput').focus()}
-async function registerPerson(p,source='manual',trocaFolga=false){
+async function registerPerson(p,source='manual',trocaFolga=false,fs=null){
   let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId);
   let existing=regs.find(r=>r.personId===pid&&r.date===n.date);
 
@@ -354,6 +365,7 @@ async function registerPerson(p,source='manual',trocaFolga=false){
     deviceId:deviceId(),
     status:trocaFolga?'TF':'P',
     trocaFolga:!!trocaFolga,
+    folgaInfo:fs?(fs.known?(fs.isFolga?'FO':'T'):'sem_calendario'):'',
     divergenciaHorario:div.has?div.type:'',
     divergenciaMinutos:div.minutes,
     atrasoPrincipal:isLate,
@@ -371,6 +383,7 @@ async function registerPerson(p,source='manual',trocaFolga=false){
   saveRegs(regs);
 
   let msg=(trocaFolga?'Troca de folga registrada':'Presença registrada')+' às '+r.time+'.';
+  if(r.folgaInfo==='FO') msg+=' (Escala marcada como folga hoje — vai para o relatório de divergências.)';
   if(div.has) msg+=' '+div.message;
   else msg+=' Horário cadastrado: '+div.shift+'.';
 
@@ -387,7 +400,7 @@ async function registerPerson(p,source='manual',trocaFolga=false){
 
   return true;
 }
-async function markByCode(code,source='manual'){if(markBusy)return;markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p&&lastFindIssue&&lastFindIssue.tipo==='duplicado'){showResult(null,'Código em mais de um cadastro: '+lastFindIssue.nomes.join(' / '),false);showPointAlert('Código repetido no cadastro.','Este código pertence a mais de um colaborador ('+lastFindIssue.nomes.join(' / ')+'). Nenhum ponto foi registrado — corrija o cadastro.');return}if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);if(fs.known&&fs.isFolga){openFolgaConfirm(p,raw,source,'folga');return}if(!fs.known){openFolgaConfirm(p,raw,source,'unknown');return}await registerPerson(p,source,false)}finally{markBusy=false}}
+async function markByCode(code,source='manual'){if(markBusy)return;markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p&&lastFindIssue&&lastFindIssue.tipo==='duplicado'){showResult(null,'Código em mais de um cadastro: '+lastFindIssue.nomes.join(' / '),false);showPointAlert('Código repetido no cadastro.','Este código pertence a mais de um colaborador ('+lastFindIssue.nomes.join(' / ')+'). Nenhum ponto foi registrado — corrija o cadastro.');return}if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);/* Sem perguntas: bipou o QR, marca presença. Folga/escala sem calendário vão só pro relatório de divergências. */await registerPerson(p,source,false,fs)}finally{markBusy=false}}
 async function principalGetExisting(r){
   const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
     '?colaborador_id=eq.'+encodeURIComponent(String(r.personId))+
@@ -430,7 +443,9 @@ async function syncPrincipal(r){
         // No Presença KN, qualquer batida válida é sempre PRESENÇA.
         // A divergência de horário continua salva apenas como informação complementar.
         divergencia_tipo:r.divergenciaHorario||null,
-        divergencia_minutos:(r.divergenciaMinutos!=null?r.divergenciaMinutos:null)
+        divergencia_minutos:(r.divergenciaMinutos!=null?r.divergenciaMinutos:null),
+        // Para o relatório de divergências (Apps Script): folga FO / T / sem_calendario
+        detalhes:{folga:r.folgaInfo||null,escala:r.escala||null,horario_cadastro:r.horarioCadastro||null,origem:'reserva'}
       })
     });
     if(!res.ok){
