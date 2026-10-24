@@ -90,7 +90,7 @@ footer{background:linear-gradient(90deg,#052c54,#0b4f86);color:#d6e9fa;padding:1
 </div>
 </section>
 <section class="card"><div class="neon-panel"><div class="neon-head"><div><h2>Painel de presença</h2><div class="neon-sub">Acompanhamento em tempo real</div></div><div class="live-pill"><span id="netDot" class="dot"></span><span id="netText"></span></div></div><div class="stats"><div class="stat"><b id="todayCount">0</b><span>presenças hoje</span></div><div class="stat"><b id="pendingCount">0</b><span>com pendência</span></div><div class="stat"><b id="rosterCount">0</b><span>colaboradores</span></div></div></div>
-<div class="destinations"><div class="dest"><strong>🏢 Sistema principal</strong><span id="principalText">Verificando...</span></div><div class="dest"><strong>📊 Google Sheets</strong><span id="sheetText">Verificando...</span></div><div class="dest"><strong>👥 Headcount</strong><span id="hcText">Verificando...</span></div></div>
+<div class="destinations"><div class="dest"><strong>🏢 Sistema principal</strong><span id="principalText">Verificando...</span></div><div class="dest"><strong>📊 Planilha (Headcount)</strong><span id="sheetText">Verificando...</span></div><div class="dest" style="display:none"><strong>👥 Headcount</strong><span id="hcText">Verificando...</span></div></div>
 <div class="compact-actions"><button id="retryBtn">↻ Sincronizar</button><button id="exportBtn">⇩ Exportar CSV</button><button id="exportPrincipalBtn" class="success" onclick="exportPrincipalFromTodayScreen()">⇩ Exportar para Principal</button></div>
 <div class="shift-box">
   <div class="shift-title"><strong>Colaboradores por horário</strong><span id="shiftSource">Atualizando...</span></div>
@@ -468,7 +468,7 @@ async function checkSheetSynced(r){
     const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
       '?colaborador_id=eq.'+encodeURIComponent(String(r.personId))+
       '&data=eq.'+encodeURIComponent(String(r.date))+
-      '&select=sheet_synced,sheet_error&limit=1';
+      '&select=hc_synced,hc_error&limit=1';
     const res=await fetch(url,{headers:{
       'apikey':SUPABASE_ANON_KEY,
       'Authorization':'Bearer '+SUPABASE_ANON_KEY
@@ -476,9 +476,9 @@ async function checkSheetSynced(r){
     if(!res.ok) throw new Error('Consulta de status HTTP '+res.status);
     const rows=await res.json();
     const row=Array.isArray(rows)&&rows.length?rows[0]:null;
-    if(row&&row.sheet_synced===true) return {confirmed:true};
-    const se=String((row&&row.sheet_error)||'');
-    return {confirmed:false,error:(se&&!/^reenviar/i.test(se))?se:(se?'Reenviando para a planilha…':'Aguardando o Supabase confirmar a gravação na planilha')};
+    if(row&&row.hc_synced===true) return {confirmed:true};
+    const se=String((row&&row.hc_error)||'');
+    return {confirmed:false,error:se||'Enviando para a planilha…'};
   }catch(e){
     return {confirmed:false,error:String((e&&e.message)||e)};
   }
@@ -500,6 +500,17 @@ async function sendNow(r){
   const p=await syncPrincipal(r);
   patchReg(r.eventId,{principalSync:p.ok?'synced':'pending',principalError:p.ok?'':(p.error||'erro no Principal'),lastTryAt:new Date().toISOString()});
   render();
+  if(p.ok) hcFastPoll();
+}
+// Confere a planilha a cada 3 s logo após um bipe (para o ✓ aparecer rápido).
+let hcFastUntil=0, hcFastTimer=null;
+function hcFastPoll(){
+  hcFastUntil=Date.now()+45000;
+  if(hcFastTimer) return;
+  hcFastTimer=setInterval(()=>{
+    if(Date.now()>hcFastUntil){clearInterval(hcFastTimer);hcFastTimer=null;return;}
+    syncHcStatus();
+  },3000);
 }
 async function syncPending(){
   if(syncing || !navigator.onLine){ render(); return; }
@@ -512,17 +523,8 @@ async function syncPending(){
       patchReg(r.eventId,{principalSync:p.ok?'synced':'pending',principalError:p.ok?'':(p.error||'erro no Principal'),lastTryAt:new Date().toISOString()});
     }
     render();
-    // 2º: conferência da planilha "Presença KN - Reserva" — só batidas dos
-    // últimos 2 dias, no máximo 15 por rodada (não trava mais a fila).
-    const desde=addDaysIso(nowParts().date,-1);
-    const conferir=loadRegs().map(normalizeOld)
-      .filter(x=>x.principalSync==='synced'&&x.sheetSync!=='synced'&&String(x.date||'')>=desde).slice(0,15);
-    for(const r of conferir){
-      const c=await checkSheetSynced(r);
-      patchReg(r.eventId,c.confirmed
-        ?{sheetSync:'synced',sheetUnconfirmed:false,sheetError:''}
-        :{sheetSync:'pending',sheetUnconfirmed:false,sheetError:c.error||'Aguardando a planilha confirmar'});
-    }
+    // 2º: confirmação da planilha (Headcount) — uma consulta só para todas.
+    await syncHcStatus();
   }finally{
     syncing=false;
     render();
@@ -555,7 +557,7 @@ async function syncHcStatus(){
       const x=map.get(String(r.personId)+'|'+r.date);
       if(!x) return;
       const st=x.hc_synced===true?'synced':'pending', err=String(x.hc_error||'');
-      if(r.hcSync!==st||r.hcError!==err){r.hcSync=st;r.hcError=err;changed=true;}
+      if(r.hcSync!==st||r.hcError!==err||r.sheetSync!==st){r.hcSync=st;r.hcError=err;r.sheetSync=st;r.sheetError=err;changed=true;}
     });
     if(changed){saveRegs(fresh);render();}
   }catch(e){}
@@ -567,35 +569,36 @@ function hcLineHtml(r){
   if(r.principalSync!=='synced') return '';
   return `<span class="hc-line pend">HC pendente${r.hcError?': '+esc(r.hcError):''}</span>`;
 }
-function overallPending(r){return r.principalSync!=='synced'||r.sheetSync!=='synced'}
+function overallPending(r){return r.principalSync!=='synced'||r.hcSync!=='synced'}
 function rowHtml(r){
   const principalLabel=r.principalSync==='synced'?'✓':'Pendente'+(r.principalError?`<br><span class="small">${esc(r.principalError)}</span>`:'');
-  const sheetLabel=r.sheetSync==='synced'?'✓':(r.sheetSync==='unknown'?'—':'Pendente');
+  const sheetLabel=r.hcSync==='synced'?'✓':(r.sheetSync==='unknown'?'—':(r.principalSync==='synced'?'Enviando…':'Pendente'));
   const sheetErrLine=r.sheetError?`<br><span class="small">${esc(r.sheetError)}</span>`:'';
-  return `<tr><td>${esc(r.time)}</td><td>${esc(r.nome)}</td><td>${esc(r.grootId||r.personId)}</td><td class="${r.principalSync==='synced'?'syncok':'syncpend'}">${principalLabel}</td><td class="${r.sheetSync==='synced'?'syncok':(r.sheetSync==='unknown'?'':'syncpend')}">${sheetLabel}${sheetErrLine}${hcLineHtml(r)}</td><td><button type="button" class="del-batida-btn" data-event-id="${esc(r.eventId||'')}" data-person-id="${esc(r.personId||'')}" data-date="${esc(r.date||'')}" data-nome="${esc(r.nome||'')}" title="Excluir esta batida">🗑</button></td></tr>`;
+  return `<tr><td>${esc(r.time)}</td><td>${esc(r.nome)}</td><td>${esc(r.grootId||r.personId)}</td><td class="${r.principalSync==='synced'?'syncok':'syncpend'}">${principalLabel}</td><td class="${r.hcSync==='synced'?'syncok':(r.sheetSync==='unknown'?'':'syncpend')}">${sheetLabel}${r.hcSync==='synced'?'':sheetErrLine}</td><td><button type="button" class="del-batida-btn" data-event-id="${esc(r.eventId||'')}" data-person-id="${esc(r.personId||'')}" data-date="${esc(r.date||'')}" data-nome="${esc(r.nome||'')}" title="Excluir esta batida">🗑</button></td></tr>`;
 }
-async function deleteBatidaSupabase(personId,date){
+async function deleteBatidaSupabase(personId,date,pin){
   try{
-    const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
-      '?colaborador_id=eq.'+encodeURIComponent(String(personId))+
-      '&data=eq.'+encodeURIComponent(String(date));
-    const res=await fetch(url,{
-      method:'DELETE',
-      headers:{
-        'apikey':SUPABASE_ANON_KEY,
-        'Authorization':'Bearer '+SUPABASE_ANON_KEY,
-        'Prefer':'return=minimal'
-      }
+    const res=await fetch(SUPABASE_URL+'/rest/v1/rpc/kn_excluir_batida',{
+      method:'POST',
+      headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Content-Type':'application/json'},
+      body:JSON.stringify({p_colab:String(personId),p_data:String(date),p_pin:String(pin||'')})
     });
-    return res.ok;
+    if(!res.ok) return 'erro';
+    return await res.json(); // 'excluido' | 'nao_encontrado' | 'senha_invalida'
   }catch(e){
-    return false;
+    return 'erro';
   }
 }
 async function deleteBatida(eventId,personId,date,nome){
   if(!personId||!date){ return; }
   const ok=window.confirm('Excluir a batida de '+(nome||'este colaborador')+' ('+date.split('-').reverse().join('/')+')?\n\nIsso remove o registro local e o registro no Principal (Supabase), liberando o colaborador para bater o ponto de novo (teste).\n\nObs.: uma linha já enviada ao Google Sheets não é apagada por aqui.');
   if(!ok) return;
+  const pin=window.prompt('Senha para excluir a batida:');
+  if(pin===null) return;
+  if(!navigator.onLine){ showResult(null,'Sem internet: a exclusão precisa confirmar a senha no Principal. Tente quando voltar a conexão.',false); return; }
+  const remoteRes=await deleteBatidaSupabase(personId,date,pin);
+  if(remoteRes==='senha_invalida'){ showResult(null,'Senha incorreta — nada foi excluído.',false); return; }
+  if(remoteRes==='erro'){ showResult(null,'Não consegui falar com o Principal — nada foi excluído. Tente de novo.',false); return; }
 
   // Remove do armazenamento local (Reserva)
   let regs=loadRegs().map(normalizeOld);
@@ -606,13 +609,7 @@ async function deleteBatida(eventId,personId,date,nome){
   });
   saveRegs(regs);
 
-  // Remove do Principal (Supabase), se houver internet
-  let remoteOk=true;
-  if(navigator.onLine){
-    remoteOk=await deleteBatidaSupabase(personId,date);
-  }else{
-    remoteOk=false;
-  }
+  const remoteOk=true;
 
   showResult(null,
     remoteOk
@@ -632,7 +629,7 @@ document.addEventListener('click',e=>{
 async function principalHistory(date){
   const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
     '?data=eq.'+encodeURIComponent(String(date))+
-    '&select=colaborador_id,data,status,hora&order=hora.desc&limit=1000';
+    '&select=colaborador_id,data,status,hora,hc_synced&order=hora.desc&limit=1000';
   const res=await fetch(url,{headers:{
     'apikey':SUPABASE_ANON_KEY,
     'Authorization':'Bearer '+SUPABASE_ANON_KEY
@@ -1188,7 +1185,7 @@ async function checkOneInSheet(item){
     const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
       '?colaborador_id=eq.'+encodeURIComponent(String(item.personId))+
       '&data=eq.'+encodeURIComponent(String(item.date))+
-      '&select=sheet_synced&limit=1';
+      '&select=hc_synced&limit=1';
     const res=await fetch(url,{headers:{
       'apikey':SUPABASE_ANON_KEY,
       'Authorization':'Bearer '+SUPABASE_ANON_KEY
@@ -1196,55 +1193,26 @@ async function checkOneInSheet(item){
     if(!res.ok) return false;
     const rows=await res.json();
     const row=Array.isArray(rows)&&rows.length?rows[0]:null;
-    return !!(row && row.sheet_synced===true);
+    return !!(row && row.hc_synced===true);
   }catch(e){
     return false;
   }
 }
 
-// "Reenviar à planilha": marca a linha no Supabase pra ser reenviada — o
-// gatilho de UPDATE aciona o Apps Script de novo. Não fala direto com o
-// Google, então funciona mesmo em aparelhos com rede restrita.
+// "Reenviar à planilha": pede ao banco para mandar de novo NA HORA
+// (função kn_hc_reenviar no Supabase). O aparelho não fala com o Google.
 async function resendToSheet(item){
   try{
-    const getUrl=SUPABASE_URL+'/rest/v1/'+TB_REG+
-      '?colaborador_id=eq.'+encodeURIComponent(String(item.personId))+
-      '&data=eq.'+encodeURIComponent(String(item.date))+
-      '&select=status,hora&limit=1';
-    const getRes=await fetch(getUrl,{headers:{
-      'apikey':SUPABASE_ANON_KEY,
-      'Authorization':'Bearer '+SUPABASE_ANON_KEY
-    }});
-    if(!getRes.ok) throw new Error('Consulta HTTP '+getRes.status);
-    const rows=await getRes.json();
-    const cur=Array.isArray(rows)&&rows.length?rows[0]:null;
-    if(!cur) return {ok:false,error:'Registro não encontrado no Principal'};
-
-    if(String(cur.status||'').toUpperCase()!=='P') return {ok:false,error:'No Principal este registro não está como P ('+(cur.status||'vazio')+')'};
-    if(!isBipeHora(cur.hora)) return {ok:false,error:'Presença marcada à mão no app principal (não bipada) — não vai pra planilha'};
-
-    // Antes isso regravava os mesmos dados esperando disparar o gatilho, mas
-    // o gatilho do Supabase só reagia a INSERT — o reenvio nunca chegava no
-    // Apps Script. Agora marca sheet_error='reenviar:<hora>', que o gatilho
-    // kn_sheet_sync_on_update (supabase_fix_sheet_trigger.sql) reconhece.
-    const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
-      '?colaborador_id=eq.'+encodeURIComponent(String(item.personId))+
-      '&data=eq.'+encodeURIComponent(String(item.date));
-    const res=await fetch(url,{
-      method:'PATCH',
-      headers:{
-        'apikey':SUPABASE_ANON_KEY,
-        'Authorization':'Bearer '+SUPABASE_ANON_KEY,
-        'Content-Type':'application/json',
-        'Prefer':'return=minimal'
-      },
-      body:JSON.stringify({
-        sheet_synced:false,
-        sheet_error:'reenviar:'+Date.now()
-      })
+    const res=await fetch(SUPABASE_URL+'/rest/v1/rpc/kn_hc_reenviar',{
+      method:'POST',
+      headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Content-Type':'application/json'},
+      body:JSON.stringify({p_colab:String(item.personId),p_data:String(item.date)})
     });
     if(!res.ok) throw new Error('Reenvio HTTP '+res.status);
-    return {ok:true};
+    const r=await res.json();
+    if(r==='enviado'||r==='ja_confirmado') return {ok:true};
+    if(r==='nao_bipada') return {ok:false,error:'Presença marcada à mão (não bipada) — não vai pra planilha'};
+    return {ok:false,error:'Registro não encontrado no Principal'};
   }catch(e){
     return {ok:false,error:String((e&&e.message)||e)};
   }
@@ -1354,9 +1322,9 @@ async function render(){
   $('pendingCount').textContent=pendingPeople;
 
   let pp=regs.filter(r=>r.principalSync!=='synced').length,
-      sp=regs.filter(r=>r.sheetSync==='pending').length;
+      sp=regs.filter(r=>r.principalSync==='synced'&&r.hcSync!=='synced'&&String(r.date||'')>=addDaysIso(today,-1)).length;
   $('principalText').textContent=pp?pp+' registro(s) pendente(s) para o Principal':'Sincronizado com o Principal';
-  $('sheetText').textContent=sp?sp+' pendente(s) de confirmação na planilha':'Sincronizado e confirmado no Google Sheets';
+  $('sheetText').textContent=sp?sp+' batida(s) indo para a planilha (envio automático)':'Tudo confirmado na planilha';
   if($('hcText')){
     if(!hcSupported){$('hcText').textContent='Ligação com a Headcount ainda não ativada no banco';}
     else{
@@ -1395,9 +1363,10 @@ async function render(){
       time:String(rr.hora||'--:--:--'),
       status:String(rr.status||'P'),
       principalSync:'synced',
-      sheetSync:'unknown',
+      sheetSync:rr.hc_synced===true?'synced':(isBipeHora(rr.hora)?'pending':'unknown'),
+      hcSync:rr.hc_synced===true?'synced':'pending',
       principalError:'',
-      sheetError:'Registro consultado no Principal'
+      sheetError:''
     });
   });
 
