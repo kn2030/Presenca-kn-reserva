@@ -228,6 +228,16 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function beep(){try{let a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.frequency.value=880;o.connect(g);g.connect(a.destination);g.gain.setValueAtTime(.08,a.currentTime);g.gain.exponentialRampToValueAtTime(.001,a.currentTime+.12);o.start();o.stop(a.currentTime+.12)}catch(e){}}
 function alertBeep(){try{let a=new (window.AudioContext||window.webkitAudioContext)();[0,260,520].forEach(ms=>{let o=a.createOscillator(),g=a.createGain();o.type='square';o.frequency.value=220;o.connect(g);g.connect(a.destination);let t=a.currentTime+ms/1000;g.gain.setValueAtTime(.12,t);g.gain.exponentialRampToValueAtTime(.001,t+.18);o.start(t);o.stop(t+.18)})}catch(e){}}
 let alertTimer=null;function showPointAlert(reason,detail,type='error'){let attention=type==='attention';if($('alertModal'))$('alertModal').classList.toggle('attention-modal',attention);$('alertTitle').textContent=attention?'ATENÇÃO':'PONTO NÃO REGISTRADO!';$('alertReason').textContent=reason||'Não foi possível registrar.';$('alertDetail').textContent=detail||'Verifique o código e tente novamente.';$('alertOverlay').classList.add('show');alertBeep();clearInterval(alertTimer);alertTimer=setInterval(alertBeep,1600);setTimeout(()=>$('alertOkBtn').focus(),40)}
+// ALERTA DE FOLGA (26/10/2026): a presença JÁ foi registrada; o alerta só
+// avisa que a pessoa está de FOLGA hoje. Não rouba o foco do campo de leitura
+// (o próximo bipe continua funcionando) e fecha sozinho em 6 s ou no próximo bipe.
+let folgaAlertTimeout=null;
+function showFolgaAlert(p,hora){
+  showPointAlert('Colaborador de FOLGA hoje: '+(p.nome||''),'Presença registrada às '+hora+' (Groot ID '+(p.grootId||p.id||'')+'). A batida vai para o relatório de divergências.','attention');
+  clearInterval(alertTimer);alertTimer=null;alertBeep();setTimeout(alertBeep,700);
+  setTimeout(()=>{try{$('codeInput').focus();$('codeInput').select()}catch(e){}},60);
+  clearTimeout(folgaAlertTimeout);folgaAlertTimeout=setTimeout(()=>{if($('alertModal')&&$('alertModal').classList.contains('attention-modal'))closePointAlert()},6000);
+}
 function closePointAlert(){clearInterval(alertTimer);alertTimer=null;$('alertOverlay').classList.remove('show');if($('alertModal'))$('alertModal').classList.remove('attention-modal');$('codeInput').focus()}
 let activeCalendarDate=nowParts().date;
 function updateClock(){
@@ -389,7 +399,7 @@ async function registerPerson(p,source='manual',trocaFolga=false,fs=null){
 
   showResult(p,msg,true);
   render();
-  beep();
+  if(r.folgaInfo==='FO') showFolgaAlert(p,r.time); else beep();
   sendNow(r).then(()=>syncPending());
 
   // Divergência de horário (atraso, entrada antecipada, ou horário/escala
@@ -400,7 +410,7 @@ async function registerPerson(p,source='manual',trocaFolga=false,fs=null){
 
   return true;
 }
-async function markByCode(code,source='manual'){if(markBusy)return;markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p&&lastFindIssue&&lastFindIssue.tipo==='duplicado'){showResult(null,'Código em mais de um cadastro: '+lastFindIssue.nomes.join(' / '),false);showPointAlert('Código repetido no cadastro.','Este código pertence a mais de um colaborador ('+lastFindIssue.nomes.join(' / ')+'). Nenhum ponto foi registrado — corrija o cadastro.');return}if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);/* Sem perguntas: bipou o QR, marca presença. Folga/escala sem calendário vão só pro relatório de divergências. */await registerPerson(p,source,false,fs)}finally{markBusy=false}}
+async function markByCode(code,source='manual'){if(markBusy)return;if(folgaAlertTimeout&&$('alertOverlay').classList.contains('show')){clearTimeout(folgaAlertTimeout);folgaAlertTimeout=null;closePointAlert()}markBusy=true;try{let raw=String(code||'').trim();if(navigator.onLine&&(!findPerson(raw)||Date.now()-rosterLastLoad>120000)){try{await loadRosterFromPrincipal(true)}catch(e){}}if(!raw){showResult(null,'Nenhum código informado.',false);showPointAlert('Nenhum QR/código foi lido.','Aproxime novamente o QR do leitor ou digite o Groot ID, matrícula ou EXT.');return}let p=findPerson(raw);if(!p&&lastFindIssue&&lastFindIssue.tipo==='duplicado'){showResult(null,'Código em mais de um cadastro: '+lastFindIssue.nomes.join(' / '),false);showPointAlert('Código repetido no cadastro.','Este código pertence a mais de um colaborador ('+lastFindIssue.nomes.join(' / ')+'). Nenhum ponto foi registrado — corrija o cadastro.');return}if(!p){showResult(null,'Código não encontrado. Confira o Groot ID, matrícula ou EXT.',false);showPointAlert('Colaborador não encontrado.','Verifique se o QR/código está correto ou se o colaborador está cadastrado.');return}let n=nowParts(),regs=loadRegs().map(normalizeOld),pid=String(p.id||p.grootId),existing=regs.find(r=>r.personId===pid&&r.date===n.date);if(existing){showResult(p,'Presença já registrada hoje às '+existing.time+'.',true);showPointAlert('Ponto já registrado hoje.','Este QR/ID já foi usado hoje para '+p.nome+' às '+existing.time+'. Nenhuma segunda batida foi criada.','attention');return}let fs=folgaStatus(p,n.date);/* Sem perguntas: bipou o QR, marca presença. Folga/escala sem calendário vão só pro relatório de divergências. */await registerPerson(p,source,false,fs)}finally{markBusy=false}}
 async function principalGetExisting(r){
   const url=SUPABASE_URL+'/rest/v1/'+TB_REG+
     '?colaborador_id=eq.'+encodeURIComponent(String(r.personId))+
